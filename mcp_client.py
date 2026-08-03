@@ -12,28 +12,29 @@ buzzword — the agent never calls requests.get() directly, it always goes
 through this MCP session.
 """
 
+import sys
 from contextlib import AsyncExitStack
+from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 
 class MCPToolClient:
-    def __init__(self, server_script: str = "mcp_server.py"):
-        self.server_script = server_script
+    def __init__(self, server_script: str = "mcp_server.py") -> None:
+        self.server_script: str = server_script
         self.session: ClientSession | None = None
-        self._stack = AsyncExitStack()
+        self._stack: AsyncExitStack = AsyncExitStack()
 
-    async def connect(self):
-        params = StdioServerParameters(command="python", args=[self.server_script])
+    async def connect(self) -> None:
+        params = StdioServerParameters(command=sys.executable, args=[self.server_script])
         stdio_transport = await self._stack.enter_async_context(stdio_client(params))
         read, write = stdio_transport
         self.session = await self._stack.enter_async_context(ClientSession(read, write))
         await self.session.initialize()
 
-    async def list_tools_for_ollama(self) -> list[dict]:
-        """Convert MCP tool definitions into Ollama's function-calling schema."""
+    async def list_tools_for_ollama(self) -> list[dict[str, Any]]:
         resp = await self.session.list_tools()
-        tools = []
+        tools: list[dict[str, Any]] = []
         for t in resp.tools:
             tools.append({
                 "type": "function",
@@ -45,10 +46,9 @@ class MCPToolClient:
             })
         return tools
 
-    async def call_tool(self, name: str, arguments: dict) -> str:
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         result = await self.session.call_tool(name, arguments)
-        # MCP returns a list of content blocks; join their text parts
         return "\n".join(c.text for c in result.content if hasattr(c, "text"))
 
-    async def close(self):
+    async def close(self) -> None:
         await self._stack.aclose()

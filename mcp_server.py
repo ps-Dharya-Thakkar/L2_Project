@@ -5,9 +5,9 @@ This process is started automatically by the orchestrator (via stdio), you
 don't run it by hand. It exposes 4 tools, each backed by a free web service
 (no API key needed for any of them):
 
-    geocode_city(city)                          -> lat/lon lookup       (Open-Meteo)
+    geocode_city(city)                          -> lat/lon lookup       (Open-Meteo + Nominatim)
     get_weather(city, date)                      -> live forecast OR
-                                                      real historical data (Open-Meteo)
+                                                        real historical data (Open-Meteo)
     get_exchange_rate(base, target)               -> live FX rate         (Frankfurter)
     get_nearby_attractions(city, radius_km)       -> real, verified places (Wikipedia)
 
@@ -19,17 +19,15 @@ else's) can talk to this server the same way.
 
 import datetime
 import time
+from typing import Any
 from mcp.server.fastmcp import FastMCP
 import requests
 
 mcp = FastMCP("travel-tools")
 
 
-def _get_with_retry(url: str, params: dict, headers: dict = None, retries: int = 1, timeout: int = 10):
-    """Small helper: retry once after a short pause on transient network
-    errors (timeouts, connection resets), instead of failing the whole tool
-    call on a one-off network hiccup."""
-    last_err = None
+def _get_with_retry(url: str, params: dict, headers: dict = None, retries: int = 1, timeout: int = 10) -> requests.Response:
+    last_err: Exception | None = None
     for attempt in range(retries + 1):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=timeout)
@@ -42,61 +40,113 @@ def _get_with_retry(url: str, params: dict, headers: dict = None, retries: int =
     raise last_err
 
 
-def _geocode(city: str, region: str = ""):
-    """Internal helper — not exposed as a tool itself, used by the others.
-    Fetches multiple candidates (some city names are ambiguous, e.g. there's
-    a 'Manali' in Himachal Pradesh AND a 'Manali' suburb of Chennai). If a
-    `region` hint is given (state/country), it's used to pick the right
-    match. Returns (lat, lon, display_name, country, warning_or_none)."""
+def _geocode_nominatim(city: str, region: str = ""):
+    """Fallback geocoder using Nominatim (OpenStreetMap) — free, no API key,
+    much better coverage for Indian cities and smaller towns."""
+    query = f"{city}, {region}" if region else city
+    try:
+        r = _get_with_retry(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "json", "limit": 3, "addressdetails": 1},
+            headers={"User-Agent": "TravelPlannerAgent/1.0 (educational project)"},
+        ).json()
+        if not r:
+            return None, f"'{query}' not found in Nominatim."
+        result = r[0]
+        display = result.get("display_name", "")
+        parts = display.split(", ")
+        country = parts[-1] if len(parts) > 1 else ""
+        lat = float(result["lat"])
+        lon = float(result["lon"])
+        name = result.get("name", city)
+        return (lat, lon, name, country), None
+    except Exception as e:
+        return None, f"Nominatim lookup failed: {e}"
+
+
+def _region_matches(region_l: str, candidate: dict) -> bool:
+    """Fuzzy region match: true if region and candidate's admin1/country
+    contain each other (either direction). Handles "United States of
+    America" vs Open-Meteo's "United States", and "India" vs "India".""" 
+    admin1 = (candidate.get("admin1", "") or "").lower()
+    country = (candidate.get("country", "") or "").lower()
+    return (
+        admin1 and (region_l in admin1 or admin1 in region_l)
+        or country and (region_l in country or country in region_l)
+    )
+
+
+def _geocode(city: str, region: str = "") -> tuple[float | None, float | None, str, str, str | None] | None:
     city = city.strip()
     region = region.strip()
-    r = _get_with_retry(
-        "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": city, "count": 5},
-    ).json()
-    results = r.get("results") or []
-    if not results:
-        return None
 
-    if len(results) == 1 or not region:
-        chosen = results[0]
-        warning = None
-        if len(results) > 1:
-            # Multiple places share this name and we have no region hint to
-            # disambiguate -- proceed with the top match, but say so clearly
-            # instead of silently guessing.
-            others = ", ".join(f"{x['name']}, {x.get('admin1', x.get('country',''))}"
-                                for x in results[1:3])
-            warning = (f"NOTE: '{city}' is ambiguous ({len(results)} places share this "
-                       f"name, e.g. also {others}). Assumed {chosen['name']}, "
-                       f"{chosen.get('admin1', '')}, {chosen.get('country', '')}. "
-                       f"If this is wrong, call again with a region, e.g. "
-                       f"city='{city}', region='<state or country>'.")
-    else:
-        region_l = region.lower()
-        match = next((x for x in results
-                      if region_l in (x.get('admin1', '') or '').lower()
-                      or region_l in (x.get('country', '') or '').lower()), None)
-        chosen = match or results[0]
-        warning = None if match else (
-            f"NOTE: region '{region}' didn't match any candidate for '{city}'; "
-            f"defaulted to {chosen['name']}, {chosen.get('admin1', '')}.")
+    # Primary: Open-Meteo
+    try:
+        r = _get_with_retry(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": city, "count": 5},
+        ).json()
+        results = r.get("results") or []
+    except Exception:
+        results = []
 
-    return (chosen["latitude"], chosen["longitude"], chosen["name"],
-            chosen.get("country", ""), warning)
+    if results:
+        if len(results) == 1 or not region:
+            chosen = results[0]
+            warning: str | None = None
+            if len(results) > 1:
+                others = ", ".join(f"{x['name']}, {x.get('admin1', x.get('country',''))}"
+                                    for x in results[1:3])
+                warning = (f"NOTE: '{city}' is ambiguous ({len(results)} places share this "
+                           f"name, e.g. also {others}). Assumed {chosen['name']}, "
+                           f"{chosen.get('admin1', '')}, {chosen.get('country', '')}. "
+                           f"If this is wrong, call again with a region, e.g. "
+                           f"city='{city}', region='<state or country>'.")
+        else:
+            region_l = region.lower()
+            match = next((x for x in results if _region_matches(region_l, x)), None)
+            if not match:
+                # Try Nominatim as fallback before giving up
+                nom_result, nom_err = _geocode_nominatim(city, region)
+                if nom_result:
+                    lat, lon, name, country = nom_result
+                    return (lat, lon, name, country,
+                            f"NOTE: Open-Meteo didn't confirm '{city}' in '{region}' "
+                            f"(candidates were mismatched). Resolved via Nominatim to "
+                            f"'{name}', {country}.")
+                candidates = ", ".join(
+                    f"{x['name']}, {x.get('admin1', x.get('country', 'unknown'))}"
+                    for x in results
+                )
+                return (None, None, city, region,
+                        f"ERROR: '{city}' in region '{region}' matched no candidate. "
+                        f"Candidates: {candidates}. "
+                        f"Clarify the city or region and try again.")
+            chosen = match
+            warning = None
+
+        return (chosen["latitude"], chosen["longitude"], chosen["name"],
+                chosen.get("country", ""), warning)
+
+    # Secondary: Nominatim fallback when Open-Meteo returned nothing
+    nom_result, nom_err = _geocode_nominatim(city, region)
+    if nom_result:
+        lat, lon, name, country = nom_result
+        return (lat, lon, name, country,
+                f"NOTE: Resolved '{city}' to '{name}', {country} via Nominatim "
+                f"(Open-Meteo had no results).")
+    return None
 
 
 @mcp.tool()
 def geocode_city(city: str, region: str = "") -> str:
-    """Look up latitude/longitude and country for a city name. Pass `region`
-    (state/province/country) if the city name might be ambiguous, e.g.
-    city='Manali', region='Himachal Pradesh' -- some city names (like
-    Manali) refer to more than one real place."""
     try:
         loc = _geocode(city, region)
         if not loc:
             return f"No location found for '{city}'."
         lat, lon, name, country, warning = loc
+        if lat is None:
+            return f"ERROR: {warning}"
         out = f"{name}, {country} -> lat={lat}, lon={lon}"
         return f"{out}\n{warning}" if warning else out
     except Exception as e:
@@ -105,20 +155,13 @@ def geocode_city(city: str, region: str = "") -> str:
 
 @mcp.tool()
 def get_weather(city: str, date: str = "", region: str = "") -> str:
-    """Get weather for a city. Pass `date` as YYYY-MM-DD if the trip date is
-    known. If that date is within the next ~15 days, this returns a REAL
-    live forecast. If the date is further out (or omitted), live forecasts
-    don't exist yet -- this instead returns REAL historical weather from the
-    same calendar date one year ago, clearly labeled as historical, so you
-    have real data to reason with instead of guessing. Pass `region`
-    (state/country) if the city name might be ambiguous, e.g. city='Manali',
-    region='Himachal Pradesh' -- some city names refer to more than one
-    real place."""
     try:
         loc = _geocode(city, region)
         if not loc:
             return f"Could not find location: {city}"
         lat, lon, name, _, warning = loc
+        if lat is None:
+            return f"ERROR: {warning}"
 
         today = datetime.date.today()
         target_date = None
@@ -131,7 +174,6 @@ def get_weather(city: str, date: str = "", region: str = "") -> str:
         days_out = (target_date - today).days if target_date else 0
 
         if target_date and 0 <= days_out <= 15:
-            # Real live forecast is available for this date.
             w = _get_with_retry(
                 "https://api.open-meteo.com/v1/forecast",
                 params={
@@ -148,8 +190,6 @@ def get_weather(city: str, date: str = "", region: str = "") -> str:
                       f"rain chance {d['precipitation_probability_max'][0]}%")
             return f"{result}\n{warning}" if warning else result
 
-        # Too far out (or no date given) -> use real historical data as a
-        # grounded stand-in for "typical" conditions, instead of an LLM guess.
         hist_date = (target_date or today.replace(day=min(today.day, 28)))
         hist_date = hist_date.replace(year=hist_date.year - 1)
 
@@ -165,8 +205,7 @@ def get_weather(city: str, date: str = "", region: str = "") -> str:
         ).json()
         d = h["daily"]
         exact_date = d["time"][0]
-        result = (f"No live forecast available yet ({name} trip date is more than "
-                  f"~15 days out). HISTORICAL weather, EXACT DATE={exact_date} "
+        result = (f"HISTORICAL weather for {name}, EXACT DATE={exact_date} "
                   f"(copy this date exactly if you mention it, do not guess a "
                   f"different year): {d['temperature_2m_min'][0]}-"
                   f"{d['temperature_2m_max'][0]}°C, {d['precipitation_sum'][0]}mm "
@@ -178,8 +217,6 @@ def get_weather(city: str, date: str = "", region: str = "") -> str:
 
 @mcp.tool()
 def get_exchange_rate(base_currency: str, target_currency: str) -> str:
-    """Get the live currency exchange rate from base_currency to
-    target_currency, e.g. base_currency='USD', target_currency='INR'."""
     try:
         r = _get_with_retry(
             "https://api.frankfurter.app/latest",
@@ -193,20 +230,15 @@ def get_exchange_rate(base_currency: str, target_currency: str) -> str:
 
 @mcp.tool()
 def get_nearby_attractions(city: str, radius_km: float = 8, region: str = "") -> str:
-    """Get a list of REAL, verified points of interest near a city, sorted
-    by distance, using Wikipedia's geosearch. ALWAYS call this before
-    naming specific places/temples/villages/viewpoints in an itinerary --
-    do not invent or guess attraction names, some 'well known' places may
-    actually be hours away from the city. radius_km caps at ~10km. Pass
-    `region` (state/country) if the city name might be ambiguous, e.g.
-    city='Manali', region='Himachal Pradesh'."""
     try:
         loc = _geocode(city, region)
         if not loc:
             return f"Could not find location: {city}"
         lat, lon, name, _, warning = loc
+        if lat is None:
+            return f"ERROR: {warning}"
 
-        radius_m = min(int(radius_km * 1000), 10000)  # Wikipedia API hard cap
+        radius_m = min(int(radius_km * 1000), 10000)
         resp = _get_with_retry(
             "https://en.wikipedia.org/w/api.php",
             params={
@@ -215,8 +247,6 @@ def get_nearby_attractions(city: str, radius_km: float = 8, region: str = "") ->
                 "gslimit": 12, "format": "json",
             },
             headers={
-                # Wikipedia's API rejects/blocks requests with no User-Agent
-                # (returns an empty/non-JSON body) -- this identifies our app.
                 "User-Agent": "TravelPlannerAgent/1.0 (student L2 project; educational use)"
             },
         )

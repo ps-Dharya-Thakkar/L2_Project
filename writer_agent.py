@@ -10,9 +10,9 @@ each agent has one clear job and its own system prompt tuned for that job.
 
 import ollama
 
-WRITER_MODEL = "qwen2.5:7b-instruct"  # bigger model for better writing quality — only called once per query, so the extra latency is worth it
+WRITER_MODEL: str = "qwen2.5:7b-instruct"
 
-WRITER_SYSTEM_PROMPT = """You are a professional travel writer.
+WRITER_SYSTEM_PROMPT: str = """You are a professional travel writer.
 You will be given a user's travel request plus research notes (weather,
 exchange rates, etc, if any were gathered by the research agent).
 
@@ -25,27 +25,29 @@ Write a well-structured Markdown itinerary using EXACTLY this format:
 For EVERY day, repeat this block:
 
 ### Day N — <short theme, e.g. "Arrival & old town">
-- **Weather:** <if research notes contain a line starting with "LIVE forecast",
-  state it plainly as a real forecast. If research notes contain a line
-  starting with "HISTORICAL weather", state it plainly labeled as historical
-  data, and copy the EXACT_DATE= value from the research notes verbatim, e.g.
-  "On this date last year: 2-9°C (historical data, no live forecast
-  available yet)". Never state a year or date different from EXACT_DATE=. If
+- **Weather:** <if research notes contain "LIVE forecast for", state it
+  plainly as a real forecast. If research notes contain "HISTORICAL weather
+  for", state it plainly labeled as historical data, and copy the
+  EXACT DATE= value from the research notes verbatim, e.g. "On this date
+  last year: 2-9°C (historical data, no live forecast available yet)".
+  Never state a year or date different from the EXACT DATE=. If
   no weather was gathered at all, say "No weather data gathered" and give a
   one-line general seasonal note from your own knowledge, clearly marked as
   general knowledge, not data.>
 - **Morning (time range):** activity/place — 1 line on what to do there
 - **Afternoon (time range):** activity/place — 1 line
 - **Evening (time range):** activity/place — 1 line
-- **Estimated day budget:** <rough range in the local currency AND the
-  user's home currency if an exchange rate was provided, e.g.
-  "₹3,000–4,000 (~$36–48)">, covering food + local transport + entry fees.
-  Label this clearly as an ESTIMATE, not a live price.
+- **Estimated day budget:** <rough range in the local currency only.
+  Never convert to USD or any other currency unless the user explicitly
+  asked for it (e.g. "also show in USD"). If the user said "budget in INR",
+  show only INR amounts. If an exchange rate was fetched but the user didn't
+  ask for conversion, still show only INR.>, covering food + local
+  transport + entry fees. Label this clearly as an ESTIMATE, not a live price.
 
 ## Budget summary
 A short table or list: per-day estimates added up into a total trip
-estimate range, plus the exchange rate used (if any) and the date it was
-fetched.
+estimate range. If the user explicitly asked for a currency conversion,
+include the exchange rate used and the date it was fetched.
 
 ## Practical notes
 Anything from research notes not already used (currency tips, weather

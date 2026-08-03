@@ -16,7 +16,7 @@ st.set_page_config(page_title="AI Travel Planner", page_icon="🧳", layout="cen
 
 st.title("🧳 AI Travel Planner")
 st.caption(
-    "Multi-agent system — Orchestrator + Writer agents, running locally via "
+    "Multi-agent system — Orchestrator + Writer + Reflection agents, running locally via "
     "Ollama, with tool access through MCP (weather, currency, geocoding, "
     "verified nearby attractions)."
 )
@@ -37,12 +37,11 @@ if plan_clicked:
         st.warning("Please enter a travel query first.")
     else:
         with st.spinner("Orchestrator is thinking and gathering research..."):
-            itinerary, tool_log, guard_notes = asyncio.run(plan_trip(query))
+            itinerary, tool_log, guard_notes, reflection_result = asyncio.run(plan_trip(query))
 
-        # --- Agent reasoning: which tools were called and why ------------
         if tool_log:
             with st.expander(
-                f"🔧 Agent reasoning — {len(tool_log)} tool call(s) made", expanded=False
+                f" Agent reasoning — {len(tool_log)} tool call(s) made", expanded=False
             ):
                 for t in tool_log:
                     st.markdown(f"**`{t['tool']}`**`({t['args']})`")
@@ -53,9 +52,8 @@ if plan_clicked:
                 "answered from reasoning alone."
             )
 
-        # --- Hallucination guards, if any fired ---------------------------
         if guard_notes:
-            with st.expander("🛡️ Hallucination guards triggered", expanded=False):
+            with st.expander(" Hallucination guards triggered", expanded=False):
                 st.caption(
                     "These fire automatically in code whenever a fact-providing "
                     "tool wasn't called or failed, to stop the Writer agent from "
@@ -64,13 +62,20 @@ if plan_clicked:
                 for note in guard_notes:
                     st.warning(note)
 
-        # --- Final itinerary -----------------------------------------------
+        if reflection_result:
+            with st.expander(" Reflection evaluation", expanded=False):
+                is_approved = reflection_result.startswith("APPROVED")
+                if is_approved:
+                    st.success("Draft itinerary approved by reflection agent.")
+                else:
+                    st.warning(f"Draft required revision:\n\n{reflection_result}")
+
         st.markdown("---")
         st.markdown(itinerary)
 
 st.markdown("---")
 st.caption(
-    "⚠️ Budget figures are LLM estimates, not live prices. Weather is either "
+    "Budget figures are LLM estimates, not live prices. Weather is either "
     "a real live forecast (trips within ~15 days) or real historical data "
     "from one year ago (further out) — never an invented guess."
 )

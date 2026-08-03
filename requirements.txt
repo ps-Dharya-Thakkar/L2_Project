@@ -1,4 +1,4 @@
-mcp
-ollama
-requests
-streamlit
+mcp>=1.28.1
+ollama>=0.6.2
+requests>=2.34.2
+streamlit>=1.60.0

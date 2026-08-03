@@ -15,11 +15,42 @@ This agent:
      Writer Agent to produce the final itinerary.
 """
 
+import re
 import ollama
+from datetime import datetime
+from typing import Any
 
-ORCH_MODEL = "qwen2.5:3b-instruct"  # llama3.2:3b was tested and unreliable at emitting tool_calls in this setup — qwen2.5:3b-instruct fires tools correctly and is still fast since it only handles the decision loop
+ORCH_MODEL: str = "qwen2.5:7b-instruct"
 
-SYSTEM_PROMPT = """You are a travel-planning research agent.
+MONTH_MAP: dict[str, int] = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+    "jun": 6, "jul": 7, "aug": 8, "sep": 9, "sept": 9,
+    "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _normalize_weather_date(args: dict[str, Any], user_query: str) -> None:
+    """If the model passed an empty/blank date to get_weather, extract
+    a month from the user query and compute a YYYY-MM-DD."""
+    date_val: str = args.get("date") or ""
+    if date_val.strip():
+        return
+
+    q: str = user_query.lower()
+    for month_name, month_num in MONTH_MAP.items():
+        if month_name in q:
+            today = datetime.now()
+            year = today.year
+            if month_num < today.month:
+                year += 1
+            args["date"] = f"{year}-{month_num:02d}-15"
+            print(f"  [normalizer] inferred date={args['date']} from '{month_name}' in query")
+            return
+
+SYSTEM_PROMPT: str = """You are a travel-planning research agent.
 Your ONLY job is to gather facts needed to plan a trip. You do NOT write the
 final itinerary yourself — a separate writer will do that.
 
@@ -30,49 +61,51 @@ anything unrelated to planning travel — reply with EXACTLY this text and
 nothing else, and do not call any tool:
 INVALID_QUERY: <one short sentence saying why this isn't a travel request>
 
-If it IS a valid travel request, continue as below.
+If it IS a valid travel request, you MUST call EVERY tool listed below
+before you stop. Do not stop after only 1 or 2 calls.
 
-Call a tool when the query needs real-world, current, or location-specific
-data:
-- weather: call get_weather(city, date, region). If the user gave or
-  implied a travel date/month, work out an approximate YYYY-MM-DD and pass
-  it — this gets you a real live forecast when possible, or real historical
-  data instead of a guess when the date is too far out.
-- currency exchange rates: get_exchange_rate
-- confirming/looking up a place: geocode_city(city, region)
-- get_nearby_attractions(city, region): ALWAYS call this before the writer
-  needs to name specific temples/villages/viewpoints/markets — it returns
-  real, distance-verified places so the plan doesn't reference attractions
-  that are actually hours away.
+REQUIRED tools (call ALL that apply):
 
-Some city names are ambiguous (e.g. there is a "Manali" in Himachal Pradesh
-AND a different "Manali" near Chennai). Always pass the `region` argument
-(state/country) when you know it, to get the correct location.
+geocode_city(city, region) — first, confirm the location.
+    If the user specified a region/state/country, pass it EXACTLY as
+    written. Example: "Himachal Pradesh" stays as "Himachal Pradesh".
+    If the user did NOT specify a region, infer it from your general
+    knowledge. Examples: "Goa" → region="India", "Manali" → region="Himachal Pradesh",
+    "Paris" → region="France", "London" → region="United Kingdom".
+    NEVER pass the city name itself as the region (e.g. do NOT pass
+    region="Goa" for city="Goa").
 
-CRITICAL RULE: never write text like "I will fetch the weather" or "let me
-check the exchange rate" — that is not a tool call and wastes a turn. If you
-need a tool, call it immediately in the same turn. Only write plain text
-once you are done calling tools and are ready to summarize.
+get_weather(city, date, region) — always compute a YYYY-MM-DD date.
+    If the user says "December" or any month, compute an approximate date
+    like "2026-12-15". NEVER pass empty string for date.
+    Use the same region as geocode_city.
 
-Do NOT call a tool for things that are subjective, creative, or things you
-already know, e.g. "suggest a romantic theme for day 2" or "what's a good
-souvenir to bring back" — reason about those yourself, no tool needed.
+get_exchange_rate(base_currency, target_currency) — if user mentions a
+    currency or asks for conversion.
 
-Once you have gathered enough information (or immediately, if no tool is
-needed at all), reply with a short plain-text summary of what you found and
-stop calling tools.
+get_nearby_attractions(city, region) — ALWAYS call this for any
+    destination city. The itinerary writer needs real place names.
+    Use the same region as geocode_city.
+
+If a tool returns an error (e.g. "ERROR: ... matched no candidate"), do
+NOT panic. Do NOT mark the query as invalid. Instead, try again with a
+different region or without a region. Errors from tools are recoverable
+— try alternative parameters.
+
+After calling ALL needed tools, write a plain-text summary of the facts
+you gathered and stop.
 """
 
 
-async def run_orchestrator(user_query: str, mcp_client, max_turns: int = 5):
+async def run_orchestrator(user_query: str, mcp_client, max_turns: int = 5) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     tools = await mcp_client.list_tools_for_ollama()
 
-    messages = [
+    messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_query},
     ]
 
-    tool_call_log = []
+    tool_call_log: list[dict[str, Any]] = []
 
     for turn in range(max_turns):
         response = ollama.chat(model=ORCH_MODEL, messages=messages, tools=tools)
@@ -80,19 +113,19 @@ async def run_orchestrator(user_query: str, mcp_client, max_turns: int = 5):
         messages.append(msg)
 
         if not msg.get("tool_calls"):
-            # Model decided it has enough info — exit the loop.
-            # DEBUG: if this triggers when you expected a tool call, print
-            # msg["content"] below to see the model's reasoning/refusal.
             print(f"  [orchestrator] turn {turn+1}: no tool called. "
                   f"Model said: {msg.get('content', '')[:200]!r}")
             return messages, tool_call_log
 
         for call in msg["tool_calls"]:
-            name = call["function"]["name"]
-            args = call["function"]["arguments"]
-            print(f"  [tool call] {name}({args})")
+            name: str = call["function"]["name"]
+            args: dict[str, Any] = call["function"]["arguments"]
 
-            result = await mcp_client.call_tool(name, args)
+            if name == "get_weather":
+                _normalize_weather_date(args, user_query)
+
+            print(f"  [tool call] {name}({args})")
+            result: str = await mcp_client.call_tool(name, args)
             tool_call_log.append({"tool": name, "args": args, "result": result})
 
             messages.append({
