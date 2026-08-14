@@ -56,6 +56,7 @@ travel-agent/
 ├── .gitignore                 # Ignores venv/, __pycache__/, .pytest_cache/
 ├── demo_transcript.md         # Walkthrough of a complete agent run
 ├── README.md
+├── screenshots/               # Evidence of working system (see below)
 └── tests/                     # Unit tests (39 tests, all pass)
     ├── __init__.py
     ├── test_geocode.py        # Geocoding disambiguation + region matching (9 tests)
@@ -92,6 +93,39 @@ travel-agent/
    ```bash
    pytest tests/ -v
    ```
+
+## Evidence / Proof of Working System
+
+This section demonstrates that the pipeline runs end-to-end and produces
+real, tool-grounded output — not just that the code compiles.
+
+> **Note:** Replace the image paths below with your actual screenshots.
+> Create a `screenshots/` folder in the repo root, drop your PNGs in it,
+> and keep the filenames (or update the paths) so the images render on
+> GitHub.
+
+### 1. CLI run — full ReAct loop + final itinerary
+
+Shows the Orchestrator making tool calls (geocode → weather → attractions),
+the Writer producing the draft, and the Reflection agent approving it.
+
+```
+screenshots/L2_SS_1.png
+screenshots/L2_SS_2.png
+```
+
+![CLI run showing ReAct tool calls](screenshots/L2_SS_1.png)
+![CLI run showing final itinerary](screenshots/L2_SS_2.png)
+
+### 2. Streamlit UI — same query, rendered in the browser
+
+```
+screenshots/L2_SS_3.png
+screenshots/L2_SS_4.png
+```
+
+![Streamlit UI showing query input](screenshots/L2_SS_3.png)
+![Streamlit UI displaying the generated itinerary](screenshots/L2_SS_4.png)
 
 ## L2 Review Context
 
