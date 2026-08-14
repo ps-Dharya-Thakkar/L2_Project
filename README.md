@@ -99,11 +99,6 @@ travel-agent/
 This section demonstrates that the pipeline runs end-to-end and produces
 real, tool-grounded output — not just that the code compiles.
 
-> **Note:** Replace the image paths below with your actual screenshots.
-> Create a `screenshots/` folder in the repo root, drop your PNGs in it,
-> and keep the filenames (or update the paths) so the images render on
-> GitHub.
-
 ### 1. CLI run — full ReAct loop + final itinerary
 
 Shows the Orchestrator making tool calls (geocode → weather → attractions),
