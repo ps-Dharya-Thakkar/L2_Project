@@ -8,7 +8,7 @@ responsibilities across two agents is the "multi-agent" part of the system —
 each agent has one clear job and its own system prompt tuned for that job.
 """
 
-import ollama
+import llm
 
 WRITER_MODEL: str = "qwen2.5:7b-instruct"
 
@@ -97,5 +97,5 @@ def run_writer(user_query: str, research_notes: str) -> str:
             f"User request: {user_query}\n\n"
             f"Research notes:\n{research_notes or '(none gathered — use general knowledge)'}"},
     ]
-    response = ollama.chat(model=WRITER_MODEL, messages=messages)
+    response = llm.chat(messages=messages, model=WRITER_MODEL)
     return response["message"]["content"]

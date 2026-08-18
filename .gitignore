@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 changes_understanding.md
+cache/
+streamlit_out.log
+streamlit_err.log
+*.log

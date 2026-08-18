@@ -16,7 +16,7 @@ This agent:
 """
 
 import re
-import ollama
+import llm
 from datetime import datetime
 from typing import Any
 
@@ -30,6 +30,15 @@ MONTH_MAP: dict[str, int] = {
     "jun": 6, "jul": 7, "aug": 8, "sep": 9, "sept": 9,
     "oct": 10, "nov": 11, "dec": 12,
 }
+
+
+def _trim_tool_result(result: str, max_len: int = 300) -> str:
+    """Trim a tool result for the LLM-history copy. Keeps the start of the
+    result (coordinates, headline figures) and marks the cut. The FULL
+    result is preserved in tool_call_log for the guards/writer/reflection."""
+    if len(result) <= max_len:
+        return result
+    return result[:max_len - 3] + "..."
 
 
 def _normalize_weather_date(args: dict[str, Any], user_query: str) -> None:
@@ -80,8 +89,10 @@ get_weather(city, date, region) — always compute a YYYY-MM-DD date.
     like "2026-12-15". NEVER pass empty string for date.
     Use the same region as geocode_city.
 
-get_exchange_rate(base_currency, target_currency) — if user mentions a
-    currency or asks for conversion.
+get_exchange_rate(base_currency, target_currency) — ONLY if the user
+    mentions two different currencies or asks for a conversion (e.g. "show
+    cost in USD too"). Do NOT call it when only one currency appears, and
+    NEVER use the same currency for both arguments.
 
 get_nearby_attractions(city, region) — ALWAYS call this for any
     destination city. The itinerary writer needs real place names.
@@ -108,7 +119,7 @@ async def run_orchestrator(user_query: str, mcp_client, max_turns: int = 5) -> t
     tool_call_log: list[dict[str, Any]] = []
 
     for turn in range(max_turns):
-        response = ollama.chat(model=ORCH_MODEL, messages=messages, tools=tools)
+        response = llm.chat(messages=messages, tools=tools, model=ORCH_MODEL) #native function calling
         msg = response["message"]
         messages.append(msg)
 
@@ -128,10 +139,18 @@ async def run_orchestrator(user_query: str, mcp_client, max_turns: int = 5) -> t
             result: str = await mcp_client.call_tool(name, args)
             tool_call_log.append({"tool": name, "args": args, "result": result})
 
+            # Trim the copy sent back into the LLM history: the ReAct loop
+            # re-sends the whole conversation every turn, so huge tool
+            # results (weather text, attraction lists) blow through Groq's
+            # per-minute token budget. The FULL result stays in tool_call_log
+            # for the guards/writer/reflection, which don't care about the
+            # LLM-history copy.
+            trimmed = _trim_tool_result(result)
             messages.append({
                 "role": "tool",
-                "content": result,
+                "content": trimmed,
                 "name": name,
+                "tool_call_id": call.get("id"),
             })
 
     return messages, tool_call_log

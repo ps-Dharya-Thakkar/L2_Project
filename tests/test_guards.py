@@ -59,6 +59,36 @@ def test_no_guard_when_tools_called():
     assert "ATTRACTIONS" in guards
 
 
+def test_fx_called_but_failed_forces_no_rate_guard():
+    """If get_exchange_rate ran but returned an error (e.g. unsupported
+    currency like AED on Frankfurter), we must still forbid invented rates."""
+    called_tools = {"get_exchange_rate"}
+    fx_calls = [
+        {"tool": "get_exchange_rate", "args": {},
+         "result": "Error fetching exchange rate: 404 Not Found"}
+    ]
+    fx_ok = any(t["result"].startswith("1 ") for t in fx_calls)
+    guards = []
+    if "get_exchange_rate" not in called_tools or not fx_ok:
+        guards.append("NO EXCHANGE RATE WAS FETCHED")
+    assert guards == ["NO EXCHANGE RATE WAS FETCHED"]
+
+
+def test_fx_success_with_conversion_request_no_suppression_guard():
+    """Rate fetched AND user asked for conversion -> no suppression guard."""
+    called_tools = {"get_exchange_rate"}
+    fx_calls = [{"tool": "get_exchange_rate", "args": {},
+                 "result": "1 AED = 26.005 INR"}]
+    fx_ok = any(t["result"].startswith("1 ") for t in fx_calls)
+    guards = []
+    if "get_exchange_rate" not in called_tools or not fx_ok:
+        guards.append("NO RATE")
+    elif not _user_wants_conversion(
+            "budget 2500 AED, show breakdown in GBP and INR"):
+        guards.append("SUPPRESS")
+    assert guards == []
+
+
 def test_attraction_fail_guard():
     tool_log = [
         {"tool": "get_nearby_attractions", "args": {}, "result": "No places found"}
@@ -78,6 +108,9 @@ def test_user_wants_conversion_yes():
     assert _user_wants_conversion("Plan trip to Paris, budget in EUR, also show in INR")
     assert _user_wants_conversion("budget in INR and show cost in USD")
     assert _user_wants_conversion("budget in INR, convert to EUR as well")
+    assert _user_wants_conversion("25000 INR, also show USD")
+    assert _user_wants_conversion("budget in INR, please show USD too")
+    assert _user_wants_conversion("show GBP as well")
 
 
 def test_user_wants_conversion_no():
@@ -88,6 +121,7 @@ def test_user_wants_conversion_no():
     assert not _user_wants_conversion("Trip to Paris, budget 2000 EUR")
     assert not _user_wants_conversion("Hello, what is the weather?")
     assert not _user_wants_conversion("Suggest a hotel in Delhi")
+    assert not _user_wants_conversion("also show the best beaches nearby")
 
 
 def test_user_wants_conversion_edge_cases():
@@ -95,6 +129,15 @@ def test_user_wants_conversion_edge_cases():
     assert not _user_wants_conversion("budget in rupees")
     # "in dollar" should match (one of our keywords)
     assert _user_wants_conversion("show cost in dollar terms")
+
+
+def test_user_wants_conversion_multicurrency_breakdown():
+    assert _user_wants_conversion(
+        "Plan a 7-day trip ... budget of 2500 AED. Also show the total "
+        "breakdown in GBP and in INR.")
+    assert not _user_wants_conversion("budget in INR")
+    assert not _user_wants_conversion("budget in rupees")
+    assert not _user_wants_conversion("Plan a trip to Manali in December")
 
 
 def test_attraction_never_called_guard():

@@ -8,7 +8,35 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from mcp_server import geocode_city, get_exchange_rate
+from mcp_server import _filter_attractions, geocode_city, get_exchange_rate
+
+
+def test_filter_attractions_removes_non_attractions():
+    fake = [
+        {"title": "Kudchade railway station", "dist": 4000},
+        {"title": "Sanvordem Assembly constituency", "dist": 5000},
+        {"title": "Quepem taluka", "dist": 9000},
+        {"title": "Rachol Fort", "dist": 9000},
+        {"title": "Menezes Braganza House", "dist": 6000},
+    ]
+    out = _filter_attractions(fake)
+    titles = [p["title"] for p in out]
+    assert "Rachol Fort" in titles
+    assert "Menezes Braganza House" in titles
+    assert "Kudchade railway station" not in titles
+    assert "Sanvordem Assembly constituency" not in titles
+    assert "Quepem taluka" not in titles
+
+
+def test_filter_attractions_ranks_landmarks_first():
+    fake = [
+        {"title": "Sanvordem", "dist": 1000},
+        {"title": "Rachol Fort", "dist": 9000},
+        {"title": "Nanda Lake", "dist": 7577},
+    ]
+    out = _filter_attractions(fake)
+    assert out[0]["title"] in ("Rachol Fort", "Nanda Lake"), \
+        f"Landmark-type titles should rank first, got {out}"
 
 
 def test_geocode_city_returns_string():

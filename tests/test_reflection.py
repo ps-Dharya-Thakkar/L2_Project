@@ -109,6 +109,21 @@ def test_flags_weather_numbers_when_no_weather_fetched():
     assert "weather" in result.lower()
 
 
+def test_approves_no_weather_data_gathered_phrase():
+    """When no weather was fetched, the hard guard tells the writer to write
+    'No weather data gathered' — that phrase is HONEST and must NOT be
+    flagged just because it contains the word 'weather'."""
+    notes = (
+        "*** HARD CONSTRAINT — NO WEATHER DATA WAS FETCHED ***"
+    )
+    draft = (
+        "## Day 1\n"
+        "- Weather: No weather data gathered; general knowledge suggests "
+        "Goa is warm in December."
+    )
+    assert run_reflection("trip to Goa", notes, draft) == "APPROVED"
+
+
 def test_approves_place_prefixed_by_generic_verb():
     """'Visit Cathedral' where 'Cathedral of Saint Étienne, Paris' is in the
     allow-list must NOT be flagged — 'Visit' is a generic verb."""

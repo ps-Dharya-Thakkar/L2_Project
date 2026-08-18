@@ -16,7 +16,11 @@ def _check_weather(research_notes: str, draft_itinerary: str) -> str | None:
 
     if not was_fetched:
         has_numbers = bool(re.search(r'\d+\.?\d*°C', draft_itinerary))
-        has_weather_section = "weather" in draft_itinerary.lower()
+        # "No weather data gathered" (which the hard guard tells the writer
+        # to write verbatim) also contains the word "weather" — only flag if
+        # the draft CLAIMS a value, not when it honestly says none was fetched.
+        has_weather_section = "weather" in draft_itinerary.lower() \
+            and "no weather data gathered" not in draft_itinerary.lower()
         if has_numbers or has_weather_section:
             return "Draft references weather data but none was fetched."
 

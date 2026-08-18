@@ -11,6 +11,7 @@ Flow:
 
 import asyncio
 import sys
+import query_cache
 from mcp_client import MCPToolClient
 from orchestrator import run_orchestrator
 from writer_agent import run_writer
@@ -19,23 +20,46 @@ from reflection_agent import run_reflection
 
 def _user_wants_conversion(query: str) -> bool:
     """Detect whether the user's query explicitly asks for a currency
-    conversion (e.g. 'also show in USD', 'convert to EUR'). If the user
-    only mentions one currency (e.g. 'budget in INR'), we should NOT
-    display a converted amount even if the orchestrator fetched an
-    exchange rate proactively."""
+    conversion (e.g. 'also show in USD', 'convert to EUR'). A query counts
+    only if TWO or more distinct currencies are mentioned, or an explicit
+    conversion verb is used. 'budget in INR' alone is NOT a conversion."""
     q = query.lower()
-    conversion_keywords = [
-        "also show in", "also in", "convert to", "in usd", "in eur",
-        "in dollars", "in pounds", "in euros", "show cost in",
-        "show in", "convert to usd", "convert to eur", "convert to gbp",
-        "both inr and usd", "both inr and", "inr to usd", "inr to",
-        "in dollar", "also in dollars", "inr in usd",
-    ]
-    return any(kw in q for kw in conversion_keywords)
+
+    currency_aliases = {
+        "usd": ("usd", "dollar"),
+        "eur": ("eur", "euro"),
+        "gbp": ("gbp", "pound"),
+        "inr": ("inr", "rupee"),
+        "aed": ("aed", "dirham"),
+        "jpy": ("jpy", "yen"),
+        "chf": ("chf", "franc"),
+        "aud": ("aud", "australian dollar"),
+        "cad": ("cad", "canadian dollar"),
+    }
+    found = set()
+    for code, (codeword, name) in currency_aliases.items():
+        if codeword in q or name in q:
+            found.add(code)
+
+    if len(found) >= 2:
+        return True
+
+    if "convert" in q or "conversion" in q:
+        return True
+
+    if found and ("show" in q or "also" in q or "in both" in q):
+        return True
+
+    return False
 
 
 def _check_ollama_models() -> list[str]:
-    """Return a list of missing model names. Empty list means all good."""
+    """Return a list of missing model names. Empty list means all good.
+    Returns [] when using the Groq cloud provider (no local model needed)."""
+    import llm
+    if llm.provider() == "groq":
+        return []
+
     import ollama
     try:
         available = {m.model for m in ollama.list().models}
@@ -143,7 +167,11 @@ async def plan_trip(user_query: str) -> tuple:
             guard_notes.append(msg)
             print(f"  [guard] {msg}")
 
-        if "get_exchange_rate" not in called_tools:
+        fx_calls = [t for t in tool_log if t["tool"] == "get_exchange_rate"]
+        fx_ok = any(
+            t["result"].startswith("1 ") for t in fx_calls
+        )
+        if "get_exchange_rate" not in called_tools or not fx_ok:
             guards.append(
                 "*** HARD CONSTRAINT — NO EXCHANGE RATE WAS FETCHED ***\n"
                 "You are FORBIDDEN from stating any specific exchange rate or "
@@ -151,7 +179,10 @@ async def plan_trip(user_query: str) -> tuple:
                 "was fetched. Give budget estimates in the currency the user "
                 "asked about only; do not convert to any other currency."
             )
-            msg = "Exchange rate not called — forbidding invented conversion rates"
+            if "get_exchange_rate" not in called_tools:
+                msg = "Exchange rate not called — forbidding invented conversion rates"
+            else:
+                msg = "Exchange rate lookup failed — forbidding invented conversion rates"
             guard_notes.append(msg)
             print(f"  [guard] {msg}")
         elif not _user_wants_conversion(user_query):
@@ -210,6 +241,14 @@ if __name__ == "__main__":
         sys.exit(1)
 
     query = input("Where do you want to go / what do you want planned?\n> ")
+    cached = query_cache.get(query)
+    if cached is not None:
+        print("\n[query-cache] Same query was planned earlier today — returning "
+              "the saved itinerary instantly (no LLM calls).")
+        print("\n" + "=" * 60)
+        print(cached["itinerary"])
+        print("=" * 60)
+        sys.exit(0)
     result, _tool_log, _guard_notes, _reflection = asyncio.run(plan_trip(query))
     print("\n" + "=" * 60)
     print(result)
