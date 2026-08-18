@@ -1,25 +1,29 @@
 # AI Travel Planner — Multi-Agent System (Local LLM + MCP)
 
-A 3-agent AI system that plans travel itineraries, running on LLMs via
-Ollama (default, fully local) and reaching external tools through the Model
-Context Protocol (MCP). Data tools are free APIs with no API keys. An
-optional Groq cloud LLM provides a fast mode. See "Fast mode" below.
+A 3-agent AI system that plans travel itineraries from a plain-language query.
+It runs through a **provider layer** (`llm.py`) that routes LLM calls to
+**Ollama** (default, fully local, `qwen2.5:7b-instruct`) or **Groq** (cloud,
+fast mode, `openai/gpt-oss-120b`) — the agents don't care which backend is
+active. Real-world data (weather, currency, geocoding, nearby attractions)
+reaches the system through the **Model Context Protocol (MCP)**, using only
+free APIs with no API keys. See "Fast mode" below.
 
 ## Agents
 
-- **Orchestrator Agent** (`qwen2.5:7b-instruct`) — reasons about your
-  query and decides, via native tool-calling, whether it needs live data.
-  Runs a ReAct loop (reason → act → observe → repeat).
-- **Writer Agent** (`qwen2.5:7b-instruct`) — takes the gathered research
-  and writes the final Markdown itinerary. Never calls tools.
+- **Orchestrator Agent** — reasons about your query and decides, via native
+  tool-calling, whether it needs live data. Runs a ReAct loop
+  (reason → act → observe → repeat).
+- **Writer Agent** — takes the gathered research and writes the final
+  Markdown itinerary. Never calls tools.
 - **Reflection Agent** (code-level, deterministic) — evaluates the draft
   itinerary against the actual fetched data. Flags hallucinated weather
   numbers, place names not in the verified list, or exchange rates that
   weren't fetched. May request a revision cycle.
 
-All three agents use the same `qwen2.5:7b-instruct` model. The Reflection
-is NOT an LLM call — it is deterministic Python string/regex checks, so it
-can never itself hallucinate.
+All three agents share the same model through the provider layer:
+`qwen2.5:7b-instruct` locally, or `openai/gpt-oss-120b` on Groq. The
+Reflection is NOT an LLM call — it is deterministic Python string/regex
+checks, so it can never itself hallucinate.
 
 ## Tools (via MCP)
 
@@ -27,7 +31,9 @@ can never itself hallucinate.
   (Open-Meteo primary + Nominatim/OSM fallback for better India/town coverage)
 - `get_weather` — live forecast (trips ≤15 days out) or real historical
   data (further out), never a guess (Open-Meteo Forecast/Archive)
-- `get_exchange_rate` — live currency conversion (Frankfurter)
+- `get_exchange_rate` — live currency conversion (Frankfurter, with a
+  free `open.er-api.com` fallback for currencies like AED that Frankfurter
+  doesn't support)
 - `get_nearby_attractions` — real, distance-verified places (Wikipedia
   geosearch)
 
@@ -180,8 +186,8 @@ A multi-agent AI system for travel itinerary generation using local LLMs (Ollama
 
 | Agent | Model | Role |
 |-------|-------|------|
-| Orchestrator | `qwen2.5:7b-instruct` | ReAct loop: decides tool calls, gathers research |
-| Writer | `qwen2.5:7b-instruct` | Formats research into Markdown itinerary |
+| Orchestrator | `qwen2.5:7b` / `gpt-oss-120b` | ReAct loop: decides tool calls, gathers research |
+| Writer | `qwen2.5:7b` / `gpt-oss-120b` | Formats research into Markdown itinerary |
 | Reflector | code-level checks | Deterministic validation of draft vs fetched data |
 
 ### MCP Tools (all free, no API keys)
@@ -190,7 +196,7 @@ A multi-agent AI system for travel itinerary generation using local LLMs (Ollama
 |------|-----|-------------|
 | `geocode_city(city, region)` | Open-Meteo Geocoding + Nominatim | City → lat/lon with region disambiguation |
 | `get_weather(city, date, region)` | Open-Meteo Forecast/Archive | Live forecast (≤15 days) or historical data |
-| `get_exchange_rate(base, target)` | Frankfurter | Live currency conversion |
+| `get_exchange_rate(base, target)` | Frankfurter + `open.er-api.com` fallback | Live currency conversion (incl. AED) |
 | `get_nearby_attractions(city, radius, region)` | Wikipedia Geosearch | Real, distance-verified POIs |
 
 ### Hallucination Guards
@@ -201,11 +207,20 @@ A multi-agent AI system for travel itinerary generation using local LLMs (Ollama
 
 ### Key Design Decisions
 
-- **One model everywhere**: All three agents use `qwen2.5:7b-instruct`. The
-  original plan used a 3B for the orchestrator/reflection (faster) and 7B
+- **One model everywhere**: All three agents share one model per provider —
+  `qwen2.5:7b-instruct` (Ollama) and `openai/gpt-oss-120b` (Groq fast mode).
+  The original plan used a 3B for the orchestrator/reflection (faster) and 7B
   for the writer, but 3B proved unreliable at tool-calling and at following
   the reflection instructions (misspelled regions, skipped tools, bogus
   "no weather data" flags). Upgrading everything to 7B fixed these.
+- **Provider layer (`llm.py`)**: A single `llm.chat()` entry point routes to
+  Groq (fast) or Ollama (local) automatically, returning one unified message
+  shape to the agents. This is why the same pipeline runs ~60x faster on Groq
+  without any agent-code changes, and falls back to Ollama during rate limits.
+- **Query-level cache**: The finished plan is cached per query
+  (`query_cache.py`, 24h TTL, normalized keys) so re-running the same query
+  returns instantly with zero LLM calls — ideal for demos and free-tier
+  budget management.
 - **Deterministic reflection instead of an LLM reviewer**: The 7B model
   still hallucinated when asked to "review" the draft (it flagging the
   geocode coordinates as weather data). Replaced with pure Python checks
@@ -255,30 +270,52 @@ regenerates with the issues added to context (max 1 revision cycle).
 ## Architecture
 
 ```
-User query (CLI or Streamlit)
-      │
-      ▼
+User query (CLI or Streamlit) ──► Query-level cache check (query_cache.py)
+                                       │ miss
+                                       ▼
 Orchestrator Agent  ───MCP (stdio/JSON-RPC)───►  MCP Server
-(qwen2.5:7b, ReAct   ◄──────tool results──────    - geocode_city
- loop, decides                                    - get_weather
- tool calls)                                      - get_exchange_rate
-      │ research notes                            - get_nearby_attractions
-      ▼
+(qwen2.5:7b / gpt-oss-120b,             ◄────── - geocode_city
+ ReAct loop, decides                          - get_weather
+ tool calls)                                  - get_exchange_rate
+       │ research notes                       - get_nearby_attractions
+       ▼                                        (each disk-cached)
 Code-level hard guards (main.py)
-      │
-      ▼
-Writer Agent (qwen2.5:7b, formatting only, no tools)
-      │ draft itinerary
-      ▼
+       │
+       ▼
+Writer Agent (formatting only, no tools)
+       │ draft itinerary
+       ▼
 Reflection (deterministic Python checks, no LLM)
-      │
-      ├── APPROVED ──► Final Markdown itinerary → CLI or Streamlit UI
-      │
-      └── REVISE ────► Writer regenerates (max 1 revision cycle)
-                           │
-                           ▼
-                       Final output
+       │
+       ├── APPROVED ──► Final Markdown itinerary → CLI or Streamlit UI
+       │                     └──► cached per query (instant re-runs)
+       └── REVISE ────► Writer regenerates (max 1 revision cycle)
+                            │
+                            ▼
+                        Final output
+
+LLM calls at every step go through the provider layer (llm.py):
+  Groq (openai/gpt-oss-120b, fast)  ── rate-limit handled ──►  Ollama
+  (qwen2.5:7b-instruct, local fallback)
 ```
+
+### LLM Provider Layer (`llm.py`)
+
+```
+llm.chat(messages, tools)
+   │
+   ├─ provider() == "groq"  ──► _groq_chat()   (openai/gpt-oss-120b, ~0.3s/call)
+   │                              │ 20s spacing, 429 retry (body-aware wait),
+   │                              │ quota exhausted? ──► _ollama_chat() fallback
+   └─ provider() == "ollama" ──► _ollama_chat() (qwen2.5:7b-instruct, offline)
+                                     └─ both return the same unified message shape
+```
+
+Both caches keep the demo fast and the free tier affordable:
+- **Tool cache** (`mcp_server.py`): geocode/weather/FX/attractions persisted
+  to `cache/travel_tools_cache.json` with per-tool TTLs (30d / 12h / 1d / 7d).
+- **Query cache** (`query_cache.py`): whole finished plans keyed by normalized
+  query text, 24h TTL — re-running a query skips the entire LLM pipeline.
 
 ## Changelog (recent)
 
