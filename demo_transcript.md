@@ -68,11 +68,11 @@ returns the Indian state of Goa — no more Genoa, and no more "Goa, Norway"
 ### Step 5: Hard guards applied
 
 ```
-[guard] Attraction lookup succeeded — 12 places allow-listed
+[guard] Attraction lookup succeeded — 20 places allow-listed
 [guard] Exchange rate fetched but user didn't ask for conversion — suppressing cross-currency display
 ```
 
-- The attraction guard extracts the 12 verified place names into an
+- The attraction guard extracts the 20 verified place names into an
   allow-list. The Writer may ONLY use these names.
 - The exchange-rate guard fires because the user only asked for INR. It
   injects a directive forbidding any USD/EUR amounts in the itinerary.

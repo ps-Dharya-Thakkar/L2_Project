@@ -39,6 +39,33 @@ def test_filter_attractions_ranks_landmarks_first():
         f"Landmark-type titles should rank first, got {out}"
 
 
+def test_filter_attractions_ranks_suffix_landmarks_first():
+    """'Charminar' carries no type word (only the suffix 'minar') — it must
+    rank ahead of a minor garden so the writer sees the city's icon."""
+    fake = [
+        {"title": "Public Gardens", "dist": 2000},
+        {"title": "Charminar", "dist": 3000},
+        {"title": "Hussain Sagar", "dist": 6000},
+        {"title": "Ameerpet", "dist": 4000},
+    ]
+    out = _filter_attractions(fake)
+    titles = [p["title"] for p in out]
+    assert titles == ["Charminar", "Hussain Sagar", "Public Gardens", "Ameerpet"], \
+        f"Suffix landmarks should lead, got {titles}"
+
+
+def test_filter_attractions_keeps_golconda_fort_style_titles():
+    fake = [
+        {"title": "Golconda Fort", "dist": 8500},
+        {"title": "Qutb Shahi Tombs", "dist": 12000},
+        {"title": "Hawa Mahal", "dist": 5000},
+    ]
+    out = _filter_attractions(fake)
+    titles = [p["title"] for p in out]
+    assert titles == ["Hawa Mahal", "Golconda Fort", "Qutb Shahi Tombs"], \
+        f"Closer landmark suffix names sort first, got {titles}"
+
+
 def test_geocode_city_returns_string():
     result = geocode_city("London")
     assert isinstance(result, str), f"Expected string, got {type(result)}"

@@ -19,6 +19,7 @@ else's) can talk to this server the same way.
 
 import datetime
 import json
+import math
 import os
 import time
 from typing import Any
@@ -358,6 +359,10 @@ _NON_ATTRACTION_MARKERS = (
     "taluka", "taluk", "village council", "gram panchayat", "metro station",
     "submission", "census", "proposed ", "under construction", "temple town",
     "central university", "institute of technology",
+    "urban development authority", "development authority", "municipal corporation",
+    "municipality", "district collectorate", "police station", "fire station",
+    "bus station", "high court", "district court", "jubilee hall",
+    "college", "university", "school", "hostel", "hotel",
 )
 
 _ATTRACTION_TYPE_WORDS = (
@@ -365,6 +370,36 @@ _ATTRACTION_TYPE_WORDS = (
     "garden", "park", "island", "point", "falls", "monastery", "cathedral",
     "viewpoint", "harbour", "lighthouse", "castle", "tower", "bridge", "square",
 )
+
+# Suffixes that end landmark names with no standalone type word — 'Charminar'
+# (minar), 'Mehrangarh' (garh), 'Hawa Mahal' (mahal), 'Qutb Shahi Tombs' (tomb).
+# Without these they rank below 'Public Gardens' and the writer never picks
+# the city's actual icons.
+_ATTRACTION_TYPE_SUFFIXES = (
+    "minar", "mahal", "garh", "fort", "tomb", "ghat", "chowk", "bazaar",
+    "mandir", "masjid", "gurudwara", "dargah", "stupa", "durg", "killa",
+    "qila", "haveli", "bagh", "sagar", "sarovar", "talab", "kund", "maidan",
+)
+
+
+def _has_landmark_suffix(title: str) -> bool:
+    """True if a title ends with a landmark suffix (handling a trailing 's').
+    Catches 'Charminar' (minar), 'Mehrangarh' (garh), 'Qutb Shahi Tombs'
+    (tomb), 'Hawa Mahal' (mahal)."""
+    t = title.lower()
+    if t.endswith("s"):
+        t = t[:-1]
+    return any(len(s) >= 4 and t.endswith(s) for s in _ATTRACTION_TYPE_SUFFIXES)
+
+
+def _is_landmark_title(title: str) -> bool:
+    """True if a geosearch title looks like a landmark: contains a landmark
+    type word ('Fort', 'Gardens') or ends with a landmark suffix
+    ('Charminar' -> minar)."""
+    t = title.lower()
+    if any(w in t for w in _ATTRACTION_TYPE_WORDS):
+        return True
+    return _has_landmark_suffix(title)
 
 
 def _filter_attractions(places: list[dict]) -> list[dict]:
@@ -379,19 +414,248 @@ def _filter_attractions(places: list[dict]) -> list[dict]:
             continue
         kept.append(p)
 
-    # Sort: entries whose title contains a landmark-type word first, then
-    # by distance (stabilises ordering, keeps the list curated).
+    # Sort: landmarks first (type word OR landmark suffix such as
+    # 'minar'/'mahal'/'garh'), and within that group the iconic single-word
+    # monuments (suffix names like 'Charminar', 'Hussain Sagar') ahead of
+    # generic parks/gardens, then by distance. This lifts the destination's
+    # icons to the top of the allow-list so the writer actually picks them.
+    # `dist` may be None for a destination-aware-search candidate we could
+    # not geocode/enrich — those sort after everything with a known distance
+    # within their landmark tier, rather than crashing the comparison.
     def rank(p: dict) -> tuple:
-        t = p["title"].lower()
-        has_type = any(w in t for w in _ATTRACTION_TYPE_WORDS)
-        return (0 if has_type else 1, p["dist"])
+        title = p["title"]
+        dist = p.get("dist")
+        dist_key = dist if dist is not None else float("inf")
+        if not _is_landmark_title(title):
+            return (1, 0, 0, dist_key)
+        return (0, 0 if _has_landmark_suffix(title) else 1, 0, dist_key)
 
     kept.sort(key=rank)
     return kept
 
 
+# ---------------------------------------------------------------------------
+# Hybrid candidate generation for get_nearby_attractions.
+#
+# Wikipedia GeoSearch (Source A) is proximity/density based: in a dense city
+# the closest 500 articles can be entirely neighbourhoods, roads, and small
+# infrastructure, so a famous landmark slightly further from the exact city
+# centroid — or just outside GeoSearch's hard 10km cap — never enters the
+# candidate pool at all. No amount of re-ranking recovers a place that was
+# never retrieved. Source B (destination-aware Wikipedia search) compensates
+# by searching Wikipedia directly for "<city> tourist attractions/landmarks/
+# forts/..." so those icons become candidates even when GeoSearch misses
+# them, after which they go through the same filtering/ranking as everything
+# else — nothing here is auto-trusted.
+# ---------------------------------------------------------------------------
+
+# Bounded, fixed set of destination-aware query templates — a constant
+# number of API calls regardless of city size, not one call per candidate.
+_ATTRACTION_QUERY_SUFFIXES = (
+    "tourist attractions", "landmarks", "monuments", "historical places",
+    "museums", "forts", "palaces", "temples",
+)
+
+_MAX_DESTINATION_SEARCH_QUERIES = 6
+_DESTINATION_SEARCH_PER_QUERY_LIMIT = 8
+
+# Category buckets used only for lightweight diversity — not attraction
+# detection. Deliberately coarse and generic (no city names).
+_CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("fort_palace", ("fort", "palace", "qila", "killa", "durg", "garh", "haveli")),
+    ("museum", ("museum",)),
+    ("religious", ("temple", "mandir", "masjid", "mosque", "church",
+                   "cathedral", "gurudwara", "dargah", "stupa", "monastery")),
+    ("market", ("bazaar", "bazar", "market", "chowk", "haat")),
+    ("water_scenic", ("lake", "sagar", "beach", "falls", "island", "sarovar",
+                       "talab", "ghat", "viewpoint", "garden", "park")),
+    ("landmark_tower", ("minar", "tower", "monument", "gate", "square", "bridge")),
+)
+
+
+def _wikipedia_search(query: str, limit: int = 8) -> list[dict]:
+    """One Wikipedia full-text search call -> list of {'title': ...}. Best
+    effort: any failure just yields no candidates from this query, it never
+    raises (the caller treats Source B as optional)."""
+    try:
+        r = _get_with_retry(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query", "list": "search",
+                "srsearch": query, "srlimit": limit, "format": "json",
+            },
+            headers={
+                "User-Agent": "TravelPlannerAgent/1.0 (student L2 project; educational use)"
+            },
+            retries=1,
+        ).json()
+        return [{"title": item["title"]}
+                for item in r.get("query", {}).get("search", [])
+                if item.get("title")]
+    except Exception:
+        return []
+
+
+def _destination_aware_search(city_name: str) -> list[dict]:
+    """Source B: search Wikipedia for '<city> tourist attractions', '<city>
+    landmarks', '<city> forts', etc. Bounded to a fixed number of queries
+    (_MAX_DESTINATION_SEARCH_QUERIES) so this scales with destinations, not
+    with candidate count. Titles are returned as raw candidates only — they
+    still go through _filter_attractions / ranking / diversity below, they
+    are not trusted outright."""
+    candidates: list[dict] = []
+    seen: set[str] = set()
+    for suffix in _ATTRACTION_QUERY_SUFFIXES[:_MAX_DESTINATION_SEARCH_QUERIES]:
+        query = f"{city_name} {suffix}"
+        for item in _wikipedia_search(query, limit=_DESTINATION_SEARCH_PER_QUERY_LIMIT):
+            key = item["title"].strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({"title": item["title"], "source": {"search"}})
+    return candidates
+
+
+def _merge_candidates(geosearch_places: list[dict],
+                       search_candidates: list[dict]) -> list[dict]:
+    """Merge Source A (GeoSearch, has 'dist') and Source B (destination-aware
+    search, no 'dist' yet) candidates, deduplicating case-insensitively by
+    normalized title. A title found by both sources keeps GeoSearch's
+    distance and gains both source tags (used later as a ranking signal)."""
+    merged: dict[str, dict] = {}
+    for p in geosearch_places:
+        key = p["title"].strip().lower()
+        merged[key] = {"title": p["title"], "dist": p.get("dist"),
+                        "source": {"geosearch"}}
+    for c in search_candidates:
+        key = c["title"].strip().lower()
+        if key in merged:
+            merged[key]["source"] |= c.get("source", {"search"})
+        else:
+            merged[key] = {"title": c["title"], "dist": None,
+                            "source": set(c.get("source", {"search"}))}
+    return list(merged.values())
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    from math import radians, sin, cos, sqrt, atan2
+    r = 6371000.0
+    p1, p2 = radians(lat1), radians(lat2)
+    dphi = radians(lat2 - lat1)
+    dlambda = radians(lon2 - lon1)
+    a = sin(dphi / 2) ** 2 + cos(p1) * cos(p2) * sin(dlambda / 2) ** 2
+    return 2 * r * atan2(sqrt(a), sqrt(1 - a))
+
+
+def _enrich_with_coordinates(candidates: list[dict], dest_lat: float,
+                              dest_lon: float, max_lookup: int = 60) -> None:
+    """Batch-fetch coordinates (prop=coordinates, up to 50 titles per call)
+    for candidates missing a distance — i.e. found only via destination-aware
+    search — so they can be geographically sanity-checked and ranked
+    alongside GeoSearch results. Bounded to `max_lookup` titles and never
+    one API call per candidate. Mutates `candidates` in place; best effort,
+    a failed batch just leaves those candidates with dist=None."""
+    need = [c for c in candidates if c.get("dist") is None][:max_lookup]
+    if not need:
+        return
+    titles = [c["title"] for c in need]
+    coord_by_title: dict[str, tuple[float, float]] = {}
+    for i in range(0, len(titles), 50):
+        batch = titles[i:i + 50]
+        try:
+            r = _get_with_retry(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "query", "prop": "coordinates",
+                    "titles": "|".join(batch), "format": "json",
+                },
+                headers={
+                    "User-Agent": "TravelPlannerAgent/1.0 (student L2 project; educational use)"
+                },
+                retries=1,
+            ).json()
+            for page in r.get("query", {}).get("pages", {}).values():
+                coords = page.get("coordinates")
+                title = page.get("title", "")
+                if coords and title:
+                    coord_by_title[title] = (coords[0]["lat"], coords[0]["lon"])
+        except Exception:
+            pass  # this batch stays distance-less; ranking treats that neutrally
+        time.sleep(0.3)
+
+    for c in need:
+        coord = coord_by_title.get(c["title"])
+        if coord:
+            c["dist"] = _haversine_m(dest_lat, dest_lon, coord[0], coord[1])
+
+
+def _drop_far_outliers(candidates: list[dict], radius_km: float,
+                        factor: float = 3.0, floor_km: float = 40.0) -> list[dict]:
+    """Destination-aware search can occasionally surface a same-named place
+    in a different city/country. Once a candidate's distance is known (via
+    GeoSearch or coordinate enrichment), drop it if it's wildly outside the
+    requested radius. Candidates whose distance is still unknown are kept —
+    they came from a destination-targeted query and we'd rather rank them
+    low than silently discard them."""
+    limit_m = max(radius_km * 1000 * factor, floor_km * 1000)
+    return [c for c in candidates if c.get("dist") is None or c["dist"] <= limit_m]
+
+
+def _source_confidence(source) -> int:
+    """Ranking signal: a candidate corroborated by both retrieval sources is
+    most trustworthy; a candidate found only via the destination-aware
+    attraction search is still more targeted than a bare proximity hit from
+    GeoSearch alone (source defaults to empty/GeoSearch-only -> 0)."""
+    if not source:
+        return 0
+    if "geosearch" in source and "search" in source:
+        return 2
+    if "search" in source:
+        return 1
+    return 0
+
+
+def _categorize(title: str) -> str:
+    t = title.lower()
+    for category, keywords in _CATEGORY_KEYWORDS:
+        if any(kw in t for kw in keywords):
+            return category
+    return "other"
+
+
+def _diversify(ranked: list[dict], limit: int = 20,
+                max_per_category: int | None = None) -> list[dict]:
+    """Lightweight diversity pass over an already popularity-ranked list: cap
+    how many results of the same rough category (fort/palace, museum,
+    religious site, market, lake/scenic, tower/monument, other) can be taken
+    before deferring further ones of that category. Scans the FULL ranked
+    list (not just the first `limit` items) so a genuine landmark that
+    ranked just outside the naive top-N still gets a chance to displace a
+    same-category item that ranked worse — otherwise this degenerates into
+    a plain top-N cutoff whenever no category cap is hit early."""
+    if not ranked:
+        return ranked
+    if max_per_category is None:
+        max_per_category = max(2, limit // 4)
+    selected: list[dict] = []
+    deferred: list[dict] = []
+    counts: dict[str, int] = {}
+    for p in ranked:
+        category = _categorize(p["title"])
+        if counts.get(category, 0) < max_per_category:
+            selected.append(p)
+            counts[category] = counts.get(category, 0) + 1
+        else:
+            deferred.append(p)
+    if len(selected) > limit:
+        selected = selected[:limit]
+    elif len(selected) < limit:
+        selected.extend(deferred[: limit - len(selected)])
+    return selected
+
+
 @mcp.tool()
-def get_nearby_attractions(city: str, radius_km: float = 8, region: str = "") -> str:
+def get_nearby_attractions(city: str, radius_km: float = 15, region: str = "") -> str:
     key = _cache_key((city, radius_km, region))
     cached = _cache_get("attractions", key)
     if cached is not None:
@@ -404,7 +668,70 @@ def get_nearby_attractions(city: str, radius_km: float = 8, region: str = "") ->
     return result
 
 
-def _get_nearby_attractions_uncached(city: str, radius_km: float = 8, region: str = "") -> str:
+def _rank_by_popularity(places: list[dict], max_candidates: int = 150) -> list[dict]:
+    """Re-rank geosearch results by Wikipedia pageviews (last 30 days) so the
+    destination's actually-famous landmarks float to the top. Geosearch alone
+    is density-based: in a dense city the 50 closest articles are
+    neighbourhoods and streets, and icons like Charminar never appear.
+    Pageviews are fetched in batches of 50 titles per call (one API call per
+    batch), then candidates are sorted by total views."""
+    if not places:
+        return places
+    candidates = places[:max_candidates]
+    titles = [p["title"] for p in candidates]
+    views: dict[str, int] = {}
+    for i in range(0, len(titles), 50):
+        batch = titles[i:i + 50]
+        try:
+            r = _get_with_retry(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "query", "prop": "pageviews",
+                    "titles": "|".join(batch), "format": "json",
+                },
+                headers={
+                    "User-Agent": "TravelPlannerAgent/1.0 (student L2 project; educational use)"
+                },
+                retries=2,
+            ).json()
+            for page in r.get("query", {}).get("pages", {}).values():
+                data = page.get("pageviews") or {}
+                views[page.get("title", "")] = sum(
+                    v for v in data.values() if isinstance(v, int))
+        except Exception:
+            pass  # a failed batch just leaves those titles at 0 views
+        time.sleep(0.5)  # stay polite to the Wikipedia API between batches
+
+    # Guard against a pageviews API outage silently producing all-zero
+    # views: if that happens, `views` carries no real signal and must not
+    # be trusted as if it did — fall back to distance-led ordering (like
+    # the pre-hybrid version) instead of letting whatever's left (source
+    # confidence) accidentally become the deciding factor.
+    views_available = any(v > 0 for v in views.values())
+
+    def rank(p: dict) -> tuple:
+        title = p["title"]
+        is_landmark = _is_landmark_title(title)
+        source_conf = _source_confidence(p.get("source"))
+        dist = p.get("dist")
+        dist_km = (dist / 1000.0) if dist is not None else 20.0
+
+        # Popularity is the dominant signal among landmarks — a famous fort
+        # should beat a minor museum even if the fort was only picked up by
+        # one retrieval source. Source confidence and distance are only
+        # small tiebreakers on top of it, never the primary sort key.
+        if views_available:
+            popularity_score = -math.log1p(views.get(title, 0)) * 10.0
+        else:
+            popularity_score = dist_km  # graceful fallback: closer first
+
+        tiebreak = -source_conf * 1.0 + dist_km * 0.1
+        return (0 if is_landmark else 1, popularity_score + tiebreak)
+
+    return sorted(candidates, key=rank)
+
+
+def _get_nearby_attractions_uncached(city: str, radius_km: float = 15, region: str = "") -> str:
     try:
         loc = _geocode(city, region)
         if not loc:
@@ -413,31 +740,73 @@ def _get_nearby_attractions_uncached(city: str, radius_km: float = 8, region: st
         if lat is None:
             return f"ERROR: {warning}"
 
+        # Source A: Wikipedia GeoSearch. Its gsradius is hard-capped at
+        # 10km by the API itself — requesting radius_km=15 does not actually
+        # search 15km, so we don't pretend it does. Source B below is what
+        # compensates for both this cap and GeoSearch's density bias.
         radius_m = min(int(radius_km * 1000), 10000)
-        resp = _get_with_retry(
-            "https://en.wikipedia.org/w/api.php",
-            params={
-                "action": "query", "list": "geosearch",
-                "gscoord": f"{lat}|{lon}", "gsradius": radius_m,
-                "gslimit": 50, "format": "json",
-            },
-            headers={
-                "User-Agent": "TravelPlannerAgent/1.0 (student L2 project; educational use)"
-            },
-        )
-        data = resp.json()
+        geosearch_places: list[dict] = []
+        try:
+            resp = _get_with_retry(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "query", "list": "geosearch",
+                    "gscoord": f"{lat}|{lon}", "gsradius": radius_m,
+                    "gslimit": "500", "format": "json",
+                },
+                headers={
+                    "User-Agent": "TravelPlannerAgent/1.0 (student L2 project; educational use)"
+                },
+            )
+            geosearch_places = resp.json().get("query", {}).get("geosearch", [])
+        except Exception:
+            geosearch_places = []  # Source B can still carry the whole result
 
-        places = data.get("query", {}).get("geosearch", [])
+        # Source B: destination-aware Wikipedia search ("<city> tourist
+        # attractions", "<city> forts", ...). Recovers famous landmarks that
+        # GeoSearch's proximity/density ranking or 10km cap would otherwise
+        # exclude entirely. Failing gracefully here is required — GeoSearch
+        # alone must still produce a usable (if less complete) list.
+        try:
+            search_candidates = _destination_aware_search(name)
+        except Exception:
+            search_candidates = []
+
+        if not geosearch_places and not search_candidates:
+            return f"No notable verified places found within {radius_km}km of {name}."
+
+        merged = _merge_candidates(geosearch_places, search_candidates)
+
+        # Enrich a bounded number of distance-less (search-only) candidates
+        # with coordinates, batched (<=50 titles/call), so they can be
+        # geographically sanity-checked and ranked alongside GeoSearch
+        # results without one API call per candidate.
+        try:
+            _enrich_with_coordinates(merged, lat, lon)
+        except Exception:
+            pass  # ranking/filtering below tolerate missing distances
+
+        merged = _drop_far_outliers(merged, radius_km)
+
+        places = _filter_attractions(merged)
         if not places:
             return f"No notable verified places found within {radius_km}km of {name}."
 
-        places = _filter_attractions(places)
-        if not places:
-            return f"No notable verified places found within {radius_km}km of {name}."
+        # Rank by landmark likelihood, source confidence, and Wikipedia
+        # popularity so the city's icons surface even when GeoSearch's
+        # closest-articles list is dominated by neighbourhoods.
+        places = _rank_by_popularity(places)
 
-        lines = [f"Verified places near {name} (sorted by distance):"]
-        for p in places[:12]:
-            lines.append(f"  - {p['title']} ({p['dist']:.0f}m away)")
+        # Lightweight diversity pass so the final list isn't dominated by
+        # one place type (e.g. 15 lakes) purely because that type happened
+        # to rank well.
+        places = _diversify(places, limit=20)
+
+        lines = [f"Verified places near {name} (sorted by popularity):"]
+        for p in places[:20]:
+            dist = p.get("dist")
+            dist_str = f"{dist:.0f}m away" if isinstance(dist, (int, float)) else "distance unknown"
+            lines.append(f"  - {p['title']} ({dist_str})")
         return "\n".join(lines)
     except Exception as e:
         return f"Error fetching nearby attractions: {e}"

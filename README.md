@@ -49,16 +49,29 @@ checks, so it can never itself hallucinate.
 - **Query-level cache** (`query_cache.py`) — the tool cache saves network
   calls, but the ~1 minute wall-clock time of a trip is dominated by the 20s
   spacing between Groq LLM calls, which run fresh every time. So the FINAL
-  plan is also cached per query (`cache/query_cache.json`, 24h TTL, keyed by
+  plan is also cached per query (`cache/query_cache.json`, keyed by
   normalized query text). Re-running an identical query returns the saved
   itinerary **instantly with zero LLM calls** — the UI shows a green
   "Served from query cache" banner and the sidebar shows the cached-query
   count. Both the Streamlit UI (`app.py`) and the CLI (`main.py`) use it.
+  **Freshness-aware TTL (mentor review):** instead of a flat 24h, each
+  cached plan's effective TTL is the *minimum* TTL of the tools used to
+  build it — weather plans expire after 2h, FX plans after 1h, attractions
+  after 24h, static (geocode-only) plans after 24h. So asking "what's the
+  weather tomorrow?" and re-asking a few hours later never returns stale
+  data, while a general itinerary still reuses the cache all day.
+- **Evaluation & monitoring** (`evaluation.py`) — every produced plan is
+  scored and logged to `cache/evaluation_log.jsonl`: similarity (cosine,
+  itinerary vs research), groundedness/faithfulness (facts used == facts
+  fetched), response accuracy (dates/labels), and retrieval precision /
+  recall / precision@k (allow-listed attractions the itinerary actually
+  used). An optional **LLM-as-a-judge** (relevance / accuracy / completeness,
+  0-10) runs when `RUN_LLM_JUDGE=1`. The UI shows all metrics per plan.
 - **Streamlit session history** — the UI stores every plan in
   `st.session_state`, so you can browse past itineraries from the sidebar
   without re-running the pipeline, and download any itinerary as Markdown.
 
-## Hallucination guards (three layers)
+## Hallucination guards (five layers)
 
 1. **Prompt engineering** — Writer and Orchestrator prompts forbid fabrication.
 2. **Code-level hard guards** — If a tool wasn't called or failed, `main.py`
@@ -68,6 +81,54 @@ checks, so it can never itself hallucinate.
 3. **Reflection agent** — Deterministic code-level checks that compare the
    draft against the actual tool output (weather numbers, allow-listed
    place names, requested currencies). Requests a revision if violated.
+   Landmark detection uses four strategies so names with no obvious type
+   keyword are still caught: a place-type token anywhere in the phrase
+   (`Baga Beach`, `Marine Drive`, `Times Square`), a place-type suffix on
+   the final word (`Charminar`, `Mehrangarh`), a travel-context word right
+   before it (`Visit Jantar Mantar`), or bold/emphasis wrapping
+   (`**Swaroop Sagar Lake**`). Template/heading words (`Day 1`, `Weather`,
+   `Estimated budget`) and the trip's own destination (`North Goa`) are
+   excluded so they never false-positive.
+4. **Tool-call completeness fallback** — after the Orchestrator finishes, a
+   plain-Python check verifies every *required* tool was called
+   (geocode/weather/attractions always; FX when a conversion is requested).
+   If one was forgotten, the model is re-prompted to make exactly that call
+   (capped at 2 rounds) instead of silently leaving the data out.
+5. **Evaluation metrics** — groundedness, similarity, response accuracy,
+   retrieval precision/recall — reported per plan and logged for monitoring.
+
+### Hybrid place validation (Layer 3 of the attraction check)
+
+The attraction check is a three-stage pipeline. Stage 1 (reflection rules)
+decides whether a phrase **looks** like a place; Stage 2 filters generic /
+template / destination words; Stage 3 (`place_validation.py`) **proves** it
+is a real place near the trip destination:
+
+    Generated itinerary
+            |
+            v
+    Candidate extractor  (4 heuristics: type / suffix / context / bold)
+            |
+            v
+    Filter generic, template & destination words
+            |
+            v
+    Geocode each candidate  (Nominatim, cached)   <- Layer 3
+            |                       |
+            v                       v
+      found + within ~60km     not found / far away
+      of the destination           |
+            |                       v
+          Keep them              Flag -> revise
+
+So `Dragon Moon Palace` is rejected even though it contains the keyword
+*"Palace"* — geocoding can't find it near the destination. `Jantar Mantar`
+mentioned for a Jaipur trip is verified (3.9 km from Jaipur). `Marine Drive`
+mentioned for a Goa trip is flagged: it *exists*, but in Mumbai ~400 km away,
+so it is not relevant to the destination. The validator is injected into
+`run_reflection`, so the offline test suite uses a stub and stays
+deterministic. Future evolution: replace the rule-based extractor with a
+real NER model (spaCy LOC/GPE/FAC) — Stage 3 validation is unchanged.
 
 ## Project structure
 
@@ -79,24 +140,31 @@ travel-agent/
 ├── orchestrator.py            # Orchestrator agent (ReAct loop)
 ├── writer_agent.py            # Writer agent (Markdown formatting)
 ├── reflection_agent.py        # Reflection (deterministic code-level checks)
+├── place_validation.py        # Layer 3: geocodes candidates to prove they
+│                              #   are real places near the destination
+├── evaluation.py              # Evaluation metrics + LLM-as-judge + monitoring log
 ├── mcp_server.py              # MCP server exposing the 4 tools + disk cache
 ├── mcp_client.py              # MCP client wrapper
-├── query_cache.py             # Query-level plan cache (24h TTL, normalized keys)
+├── query_cache.py             # Query-level plan cache (freshness-aware TTL)
 ├── requirements.txt           # Python dependencies (pinned)
 ├── .gitignore                 # Ignores venv/, __pycache__/, cache/, .pytest_cache/
 ├── cache/                     # Disk cache for tool + query results (gitignored)
 ├── demo_transcript.md         # Walkthrough of a complete agent run
 ├── README.md
 ├── screenshots/               # Evidence of working system (see below)
-└── tests/                     # Unit tests (68 tests, all pass)
+└── tests/                     # Unit tests (130 tests, all pass)
     ├── __init__.py
-    ├── test_geocode.py        # Geocoding disambiguation + region matching (9 tests)
+    ├── test_geocode.py        # Geocoding disambiguation + region matching (8 tests)
     ├── test_mcp_tools.py      # MCP tool function smoke tests (8 tests)
     ├── test_cache.py          # Persistent disk cache (6 tests)
     ├── test_query_cache.py    # Query-level plan cache (6 tests)
-    ├── test_guards.py         # Hallucination guard logic (12 tests)
-    ├── test_llm_fallback.py   # Groq→Ollama fallback + token hygiene (13 tests)
-    ├── test_reflection.py     # Reflection checks (11 tests)
+    ├── test_guards.py         # Hallucination guard logic (13 tests)
+    ├── test_llm_fallback.py   # Groq→Ollama fallback + token hygiene (11 tests)
+    ├── test_reflection.py     # Reflection checks (12 tests)
+    ├── test_review_fixes.py   # Mentor-review fixes: completeness, cache TTL,
+    │                          #   detailed weather, creative landmark detection,
+    │                          #   geocode validation, evaluation metrics (50 tests)
+    ├── test_place_validation.py  # Layer 3 geocoding validation (10 tests)
     └── test_invalid_query.py  # INVALID_QUERY rejection (4 tests)
 ```
 
@@ -320,8 +388,102 @@ Both caches keep the demo fast and the free tier affordable:
 ## Changelog (recent)
 
 All changes below were made and verified in this session. Every one is covered
-by the test suite (68 tests, all passing) and demonstrated live against Groq
+by the test suite (130 tests, all passing) and demonstrated live against Groq
 and Ollama.
+
+### Mentor-review fixes (L2 follow-up)
+- **Evaluation & monitoring (`evaluation.py`, new module):** every produced
+  plan is scored and appended to `cache/evaluation_log.jsonl`:
+  - `groundedness` / `faithfulness` — fraction of itinerary fact claims
+    (temperatures, FX rates, dates) that trace back to actually-fetched
+    research; 1.0 = nothing invented. Temperatures are matched within ±0.6°C
+    so the writer's rounding (24 vs 24.3) is not punished.
+  - `similarity_score` — cosine similarity of token-frequency vectors between
+    the research notes and the final itinerary.
+  - `response_accuracy` — dates in the itinerary must match fetched dates;
+    historical weather must not be sold as a forecast.
+  - `retrieval_metrics` — IR-style precision / recall / precision@k over the
+    attraction allow-list: retrieved = places fetched from Wikipedia,
+    relevant = places the itinerary actually used.
+  - **LLM-as-a-judge** (`llm_as_judge`) — optional single LLM call scoring
+    relevance / accuracy / completeness (0-10) plus a justification, enabled
+    with `RUN_LLM_JUDGE=1`. Wired into `main.py` (CLI prints the block),
+    `app.py` (metrics expander with `st.metric`), and always logged.
+- **Tool-call completeness fallback (`main.py`):** a plain-Python
+  `_required_tools()` / `_missing_required_tools()` decides which tools MUST
+  have run for a query (geocode, weather, attractions always; FX iff a
+  conversion is requested). If the Orchestrator forgot one, the model is
+  re-prompted to make exactly that call and the result is appended to the
+  shared tool log — capped at 2 rounds so a stubborn model can't loop. The
+  old behavior was to silently fall into a hard guard; now it is recovered
+  first, and guards only fire if recovery truly fails.
+- **Detailed weather validation (`reflection_agent.py`):** the reflection
+  agent now parses the fetched weather fact (live vs historical, exact
+  min-max, EXACT DATE=) and checks that the draft (a) states a temperature
+  range grounded in the fetched data, (b) labels historical data as
+  historical (never as a forecast), (c) uses the correct year when it
+  mentions a date, and (d) actually includes a weather section when data
+  was fetched.
+- **Robust attraction matching (`reflection_agent.py`):** place-name checks
+  moved from a naive two-word regex to normalized + fuzzy matching.
+  `_norm()` transliterates accents (Saint Étienne → saint etienne) and the
+  matcher accepts multi-word names (Bohra Ganesh Temple), names the writer
+  truncated (dropped ", Paris"), and preposition forms (Church of
+  Saint-Jean-le-Rond), while generic leader verbs ("Visit X") no longer
+  produce false positives. Hallucinated places are still caught.
+- **Creative landmark detection (`reflection_agent.py`):** the attraction
+  check no longer relies on a fixed `Beach/Temple/Fort...` keyword list.
+  A landmark is now caught by ANY of four strategies, so names with no
+  obvious type word are still detected:
+  1. a place-type token anywhere in the phrase — `Baga Beach`,
+     `Marine Drive` (Drive), `Times Square` (Square);
+  2. a place-type **suffix** on the final word — `Charminar` (minar),
+     `Mehrangarh` (garh), `Hawa Mahal` (mahal);
+  3. a travel-context word directly before the capitalized phrase —
+     `Visit Jantar Mantar`, `walk along Marine Drive`;
+  4. bold/emphasis wrapping — `**Swaroop Sagar Lake**`.
+  To stay false-positive-free it also (a) strips generic leaders/modifiers
+  (`Visit`, `the`, `famous`), (b) drops lone generic type words (`the
+  beach`, `an old fort`), (c) drops template/heading words (`Day 1`,
+  `Weather`, `Estimated day budget`, `Top attractions`), and (d) whitelists
+  the trip's own destination parsed from the geocode/weather/attraction
+  results, so `fly into Goa`, `North Goa` or a bolded `**Udaipur**` title
+  are never flagged. Verified end-to-end on the real Udaipur run: a
+  hallucinated `Moti Magri` is caught, the real itinerary approves.
+- **Freshness-aware query-cache TTL (`query_cache.py`):** the flat 24h TTL
+  was wrong for plans that embed volatile data. `effective_ttl()` now returns
+  the MINIMUM TTL across the tools a plan used: weather 2h, FX 1h,
+  attractions 24h, static 24h. A plan about "tomorrow's weather" expires in
+  2h even though a general itinerary still caches all day — exactly the
+  per-component permutation the reviewer asked for.
+- **Hybrid place validation (`place_validation.py`, new module):** the
+  attraction check is now a 3-stage pipeline — (1) rule-based candidate
+  extraction, (2) generic/template/destination filtering, (3) **geocoding
+  validation** that *proves* a candidate is a real place near the requested
+  destination instead of only judging whether the text "looks like" a
+  landmark. `PlaceValidator` geocodes each candidate via Nominatim (cached,
+  paced to 1 req/s) and measures the great-circle distance: found + within
+  60 km → verified/kept; not found or far away → flagged for revision.
+  Verified live: `Jantar Mantar` for a Jaipur trip is accepted (3.9 km);
+  `Dragon Moon Palace` for a Goa trip is rejected (geocoder finds nothing);
+  `Marine Drive` for a Goa trip is rejected (exists, but in Mumbai ~400 km
+  away — not relevant). Wired into `run_reflection`/`_check_attractions` as
+  an injected validator, so the offline test suite stays deterministic with
+  a stub lookup (16 new tests). Future evolution: swap the rule-based
+  extractor for a real NER model (spaCy LOC/GPE/FAC) — Layer 3 is unchanged.
+- **Icon-surfacing retrieval fix (`mcp_server.py`):** a Hyderabad itinerary
+  was skipping Charminar, Hussain Sagar and Golconda Fort for Gyan Bagh
+  Palace and Public Gardens. Root cause: Wikipedia geosearch is
+  *density-based* — in a dense city the 50 closest geo-tagged articles are
+  neighbourhoods and infrastructure, and the icons sit at positions 50-250.
+  Fixed by (a) fetching 500 candidates (gslimit=500) instead of 50, (b)
+  widening the non-attraction filter (drops colleges, hospitals, municipal
+  corporations, high courts, hotels...), and (c) re-ranking the candidates by
+  **Wikipedia pageview popularity (30-day)**, with landmarks always ranked
+  ahead of neighbourhoods. Live check: Hyderabad now leads with Charminar,
+  Hussain Sagar, Chowmahalla Palace, Falaknuma Palace; Jaipur with Amber
+  Fort, City Palace, Albert Hall, Hawa Mahal; Udaipur with Fateh Sagar Lake,
+  Bagore Ki Haveli, Gangaur Ghat, Jagdish Temple, Lake Pichola.
 
 ### LLM provider layer (`llm.py`)
 - Added a unified provider layer: `llm.chat()` routes to Groq (fast mode) or
@@ -416,23 +578,34 @@ and Ollama.
 - The tool cache saves network calls, but a trip's ~1 minute wall-clock time
   is dominated by the 20s spacing between Groq LLM calls — which run fresh
   every time. So the FINAL plan is cached per query in
-  `cache/query_cache.json` (24h TTL), keyed by a normalized hash of the
-  query text (lowercase, whitespace/punctuation-stripped, so
+  `cache/query_cache.json`, keyed by a normalized hash of the query text
+  (lowercase, whitespace/punctuation-stripped, so
   `"Plan a  trip to   Goa!"` hits the same entry as `"plan a trip to goa"`).
 - A repeat query now returns the saved itinerary **instantly, with zero LLM
   calls** — wired into both the Streamlit UI (`app.py`, green "Served from
   query cache" banner + cached-query count in the sidebar) and the CLI
   (`main.py`, prints a `[query-cache]` note and exits early).
+- **Freshness-aware expiry (mentor review):** TTL is no longer flat 24h —
+  `effective_ttl()` takes the minimum TTL across the tools used to build a
+  plan (weather 2h, FX 1h, attractions 24h, static 24h), so volatile plans
+  expire early while static ones live all day.
 - This is a big win for demos: pre-run each showcase query once, and the
   live review runs them instantly without burning the Groq daily budget.
 
 ### Streamlit UI (`app.py`)
+- **Non-technical-friendly design**: tabbed layout — **🗺️ Your Itinerary**
+  (the plan + download), **✅ Quality Report** (color-coded gauges with a
+  plain-language verdict, e.g. "✅ Excellent quality — every fact verified",
+  plus the optional LLM-as-a-judge scores), and **🔎 How it was built**
+  (real tools called, safety checks that fired, provider + timing).
+- **One-click example queries**: five showcase buttons above the input box
+  that fill the query field automatically — ideal for demos.
 - **Session history**: every plan is stored in `st.session_state`; the sidebar
   lists past queries so you can re-view an old itinerary without re-running
   the pipeline. A "Clear history" button resets the session.
 - **Download** button exports any itinerary as `.md`.
-- **Sidebar status** shows the active LLM provider (Groq/Ollama) and the
-  cache status; each completed plan shows its elapsed time.
+- **Sidebar status** shows the active LLM provider (Groq/Ollama), cache
+  status, and a friendly project description.
 
 ### Tests
 - `tests/test_llm_fallback.py` (13 tests) — Groq→Ollama fallback, backoff
@@ -442,9 +615,15 @@ and Ollama.
   TTL expiry, cross-process persistence.
 - `tests/test_query_cache.py` (6 tests) — query-cache round-trip, key
   normalization, miss-on-different-query, TTL expiry, live-count.
-- `tests/test_guards.py` — added multi-currency-conversion and
-  FX-called-but-failed guard cases.
-- Suite grew from 42 → **68 tests, all passing**.
+- `tests/test_review_fixes.py` (32 tests, new) — tool-call completeness
+  checker, freshness-aware cache TTL, detailed weather validation, robust
+  fuzzy attraction matching, and the evaluation-metrics functions.
+- `tests/test_place_validation.py` (16 tests, new) — hybrid Layer-3 place-name
+  validation: distance math, destination parsing, injected-lookup validator,
+  allow-list + geocoding interaction across all guard branches.
+- `tests/test_mcp_tools.py` — added landmark-title ranking and
+  popularity-ranking cases for the Hyderabad-style icon-surfacing fix.
+- Suite grew from 42 → **130 tests, all passing**.
 
 ## Known limitations
 
@@ -456,14 +635,19 @@ and Ollama.
   once, and repeat runs cost zero tokens.
 - Local 7B models are still not 100% reliable at tool-calling — occasionally
   they skip a call they should have made, or pass an approximate date when
-  the user gives no month.
-- `get_nearby_attractions` uses Wikipedia geosearch (nearest-by-distance),
-  not a curated "top tourist attractions" ranking. A built-in filter drops
-  obvious non-attractions (railway stations, assembly constituencies,
-  talukas, villages) and ranks landmark-type titles (forts, beaches,
-  temples, lakes, houses) first — but it is still distance-based, so it may
-  surface lesser-known spots instead of the famous landmarks. This is a
-  deliberate tradeoff: verified-but-obscure beats famous-but-unverified.
+  the user gives no month. **Mitigations:** the tool-call completeness
+  fallback re-prompts the model for any required-but-missing tool, the
+  date normalizer fills in approximate dates, and the hard guards forbid
+  invention if recovery fails.
+- `get_nearby_attractions` uses Wikipedia geosearch (nearest-by-distance) as
+  the source of *verified* nearby places, then re-ranks the candidates by
+  Wikipedia pageview popularity (last 30 days) so the destination's actual
+  icons surface instead of nearby-but-obscure streets. The built-in filter
+  drops non-attractions (railway stations, assembly constituencies, talukas,
+  villages, colleges, hospitals) and landmarks always rank ahead of
+  neighbourhoods — but a landmark with no geosearch coverage (e.g. a monument
+  whose article lacks coordinates) can still be missed. This is a deliberate
+  tradeoff: verified-but-obscure beats famous-but-unverified.
 - Budget figures are LLM estimates, not live pricing data.
 - `get_weather` only returns live forecasts within ~15 days; further-out
   trips use historical archive data (clearly labeled), because no API can

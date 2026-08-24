@@ -74,6 +74,11 @@ Rules:
   market area" (generic for the unverified part).
   Example of WRONG behavior: adding "and Solang Valley" when Solang Valley
   never appeared in the verified list.
+- When the verified list contains several places, PREFER the destination's
+  most famous/iconic landmarks for the itinerary — the sights tourists
+  actually go to see (e.g. Charminar and Golconda Fort for Hyderabad), not
+  minor or obscure entries that happen to be listed first. Still only ever
+  use names that appear in the verified list.
 - If no verified places were provided at all, keep ALL activities generic
   (e.g. "explore the old town market area", "local sightseeing near the
   hotel") instead of guessing specific place names.
